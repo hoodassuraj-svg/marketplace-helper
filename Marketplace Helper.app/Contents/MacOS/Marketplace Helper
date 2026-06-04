@@ -1,74 +1,9 @@
 #!/bin/bash
-# Launcher inside the .app bundle. Handles first-run setup, then launches the GUI.
+# Launcher inside the .app bundle.
 DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$DIR"
-
-# Strip quarantine from the whole folder so nothing else gets blocked.
-xattr -dr com.apple.quarantine "$DIR" 2>/dev/null
-
-# ── First run: open Terminal, run setup with visible progress, relaunch ───────
-if [ ! -f ".venv/bin/python" ]; then
-    SETUP="$DIR/.first_run_setup.command"
-    cat > "$SETUP" << SCRIPT
-#!/bin/bash
-cd "$DIR"
-clear
-echo "============================================"
-echo "  Marketplace Helper — First-time Setup"
-echo "  (this only happens once)"
-echo "============================================"
-echo ""
-if ! command -v python3 &>/dev/null; then
-    echo "ERROR: Python 3 is not installed."
-    echo "Download it from https://www.python.org/downloads/ then try again."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-echo "Setting up (1/2)..."
-python3 -m venv .venv
-.venv/bin/pip install -q -r requirements.txt
-echo "Installing browser (2/2, may take a minute)..."
-.venv/bin/playwright install chromium
-rm -f "$SETUP"
-echo ""
-echo "Done! Launching Marketplace Helper..."
-sleep 1
-open "$DIR/Marketplace Helper.app"
-osascript -e 'tell application "Terminal" to close (every window whose name contains ".first_run_setup")' 2>/dev/null &
-exit 0
-SCRIPT
-    chmod +x "$SETUP"
-    open -a Terminal "$SETUP"
-    exit 0
-fi
-
-# ── Normal launch ─────────────────────────────────────────────────────────────
-LOG="$DIR/launch_error.log"
-
-# Pick a working Python (absolute path), preferring the venv.
-if [ -x "$DIR/.venv/bin/python" ]; then
-    PY="$DIR/.venv/bin/python"
+if [ -f ".venv/bin/python" ]; then
+    ".venv/bin/python" app.py
 else
-    PY="$(command -v python3)"
-fi
-
-# Record exactly what happens, every launch, for easy diagnosis.
-{
-    echo "=== launch $(date) ==="
-    echo "DIR=$DIR"
-    echo "PY=$PY"
-    echo "PATH=$PATH"
-} > "$LOG"
-
-# Run the app from its own directory, capturing stdout+stderr.
-( cd "$DIR" && "$PY" app.py ) >> "$LOG" 2>&1
-CODE=$?
-echo "=== exited with code $CODE ===" >> "$LOG"
-
-# Only show the failure dialog on a real non-zero exit (not a normal quit).
-if [ $CODE -ne 0 ]; then
-    ERR="$(tail -n 15 "$LOG" 2>/dev/null)"
-    osascript -e "display dialog \"Marketplace Helper couldn't start.
-
-$ERR\" buttons {\"OK\"} with title \"Marketplace Helper\" with icon caution" >/dev/null 2>&1
+    python3 app.py
 fi
