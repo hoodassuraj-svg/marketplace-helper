@@ -303,65 +303,80 @@ def fetch_realm(url: str) -> ListingData:
             context.close()
             browser.close()
 
-    # ---- Pull fields from the two responses --------------------------------
+    # ---- Pull fields from the responses ------------------------------------
+    # For the old shared-portal URL, data comes from two blobs:
+    #   portal_blob  → title, meta (price/type), html (remarks), images
+    #   search_item  → streetAddress, city, bedrooms, bathrooms, images
+    # For the new /view/listing/ URL, everything is in portal_blob, with
+    # detailed fields nested under portal_blob["summary"].
+    summary = portal_blob.get("summary") or {}  # new format nested fields
 
     # Title: top-level in portal blob, or build from address.
     data.title = (portal_blob.get("title") or "").strip()
 
-    # Street + city: search result has the cleanest address fields.
-    data.street = (search_item.get("streetAddress") or "").strip()
-    data.city = (search_item.get("city") or "").strip()
+    # Street + city: search result (old) or summary (new).
+    data.street = (search_item.get("streetAddress") or summary.get("streetAddress") or "").strip()
+    data.city   = (search_item.get("city")          or summary.get("city")          or "").strip()
     if not data.street and data.title:
         data.street, data.city = _split_address(data.title)
 
-    # Street name without house number (used for the Marketplace location field).
-    # Realm gives us streetName separately; fallback strips leading digits from street.
-    raw_street_name = (search_item.get("streetName") or "").strip()
+    # Street name without house number.
+    raw_street_name = (search_item.get("streetName") or summary.get("streetName") or "").strip()
     if raw_street_name:
         data.street_name = raw_street_name
     elif data.street:
         data.street_name = re.sub(r"^\d+\s*", "", data.street).strip()
 
-    # Price: search result has both the number and the formatted string.
-    price_num = search_item.get("listPrice") or search_item.get("price") or ""
-    price_fmt = (
-        search_item.get("listPriceFormatted")
-        or portal_blob.get("meta", {}).get("price")
-        or ""
-    )
+    # Price.
+    price_num = (search_item.get("listPrice") or search_item.get("price")
+                 or summary.get("listPrice") or summary.get("price") or "")
+    price_fmt = (search_item.get("listPriceFormatted")
+                 or summary.get("listPriceFormatted")
+                 or portal_blob.get("meta", {}).get("price") or "")
     data.price, data.raw_price = _clean_price(price_fmt or str(price_num))
 
     # Type: sale vs rent.
     sale_or_rent = (
         search_item.get("saleOrRent")
+        or summary.get("saleOrRent")
         or portal_blob.get("meta", {}).get("saleOrRent")
         or "SALE"
     ).lower()
     data.listing_type = "rent" if any(w in sale_or_rent for w in ("rent", "lease")) else "sale"
 
-    # Description: extracted from the html field in the portal blob.
+    # Description.
     data.description = _realm_description_from_html(portal_blob.get("html", ""))
 
-    # Bedrooms / bathrooms -- skip if 0 or missing (Facebook won't accept 0).
-    beds = search_item.get("bedrooms", "")
-    beds_extra = search_item.get("bedroomsPossible", 0)
+    # Bedrooms / bathrooms -- check search_item first (old), then summary (new).
+    beds = search_item.get("bedrooms", "") or summary.get("bedrooms", "")
+    beds_extra = search_item.get("bedroomsPossible", 0) or summary.get("bedroomsPossible", 0)
     total_beds = (int(beds) + int(beds_extra or 0)) if beds else 0
     data.bedrooms = str(total_beds) if total_beds > 0 else ""
-    baths = int(search_item.get("bathrooms", "") or 0)
+    baths = int(search_item.get("bathrooms", "") or summary.get("bathrooms", "") or 0)
     data.bathrooms = str(baths) if baths > 0 else ""
-    data.property_type = _realm_type_to_fb(search_item.get("typeName", ""))
-    sq = search_item.get("squareFeet", "") or ""
+    data.property_type = _realm_type_to_fb(
+        search_item.get("typeName", "") or summary.get("typeName", ""))
+    sq = search_item.get("squareFeet", "") or summary.get("squareFeet", "") or ""
     data.square_feet = re.sub(r"[^\d]", "", str(sq).split("-")[0]) if sq else ""
 
-    # Photos: decode CDN URLs to get original high-res TREB images.
-    raw_photos = search_item.get("images") or []
+    # Photos: prefer search_item images (old), fall back to portal_blob images (new).
+    raw_photos = (search_item.get("images")
+                  or portal_blob.get("images")
+                  or summary.get("images") or [])
+    realm_base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
     for p in raw_photos:
-        if isinstance(p, str) and p.startswith("http"):
-            data.photos.append(_fullres_photo_url(p))
+        raw_u = ""
+        if isinstance(p, str):
+            raw_u = p
         elif isinstance(p, dict):
-            u = p.get("url") or ""
-            if u.startswith("http"):
-                data.photos.append(_fullres_photo_url(u))
+            raw_u = p.get("url") or ""
+        if not raw_u:
+            continue
+        # Make relative URLs absolute using the Realm domain.
+        if raw_u.startswith("/"):
+            raw_u = realm_base + raw_u
+        if raw_u.startswith("http"):
+            data.photos.append(_fullres_photo_url(raw_u))
     data.photos = _dedupe_photos(data.photos)
 
     # Fallback: if we got almost nothing, try the standard HTML extractors.
