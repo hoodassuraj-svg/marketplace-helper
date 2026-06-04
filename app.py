@@ -56,22 +56,14 @@ class App:
     # ── Force the window to the foreground (it opens behind apps when launched
     #    from a .app bundle, which looks like "nothing happened"). ─────────────
     def _bring_to_front(self):
+        # Pure-Tkinter activation only — no osascript (which needs special
+        # Automation permission under a Finder-launched .app and can fail there).
         self.root.update_idletasks()
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.root.after(500, lambda: self.root.attributes("-topmost", False))
         self.root.focus_force()
-        if sys.platform == "darwin":
-            # Tell macOS to activate this process so the window actually shows.
-            try:
-                os.system(
-                    "osascript -e 'tell application \"System Events\" to set "
-                    "frontmost of the first process whose unix id is %d to true' "
-                    ">/dev/null 2>&1 &" % os.getpid()
-                )
-            except Exception:
-                pass
 
     # ── Fix macOS Tk 8.6 bug where Cmd+C/V/X/A don't work in text fields ──────
     def _enable_clipboard(self):

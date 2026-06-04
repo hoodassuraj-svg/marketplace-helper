@@ -43,16 +43,29 @@ SCRIPT
 fi
 
 # ── Normal launch ─────────────────────────────────────────────────────────────
-# Pick a working Python: prefer the venv, fall back to system python3.
-PY=".venv/bin/python"
-[ -x "$PY" ] || PY="$(command -v python3)"
-
-# Run the app, capturing any crash so failures aren't silent.
 LOG="$DIR/launch_error.log"
-"$PY" app.py 2>"$LOG"
-CODE=$?
 
-# If it crashed, show the user what went wrong instead of failing silently.
+# Pick a working Python (absolute path), preferring the venv.
+if [ -x "$DIR/.venv/bin/python" ]; then
+    PY="$DIR/.venv/bin/python"
+else
+    PY="$(command -v python3)"
+fi
+
+# Record exactly what happens, every launch, for easy diagnosis.
+{
+    echo "=== launch $(date) ==="
+    echo "DIR=$DIR"
+    echo "PY=$PY"
+    echo "PATH=$PATH"
+} > "$LOG"
+
+# Run the app from its own directory, capturing stdout+stderr.
+( cd "$DIR" && "$PY" app.py ) >> "$LOG" 2>&1
+CODE=$?
+echo "=== exited with code $CODE ===" >> "$LOG"
+
+# Only show the failure dialog on a real non-zero exit (not a normal quit).
 if [ $CODE -ne 0 ]; then
     ERR="$(tail -n 15 "$LOG" 2>/dev/null)"
     osascript -e "display dialog \"Marketplace Helper couldn't start.
