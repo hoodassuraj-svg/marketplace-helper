@@ -349,10 +349,11 @@ def _run_poster(url: str) -> str:
 
             # Save draft BEFORE closing the context — gives FB time to register the click.
             print("Saving as draft…")
-            save_draft(page)
-            page.wait_for_timeout(1500)   # extra buffer after save
+            saved = save_draft(page)
+            page.wait_for_timeout(2000)   # extra buffer after save
 
-            result = "success"
+            if saved:
+                result = "success"
             ctx.close()
 
     except Exception as e:

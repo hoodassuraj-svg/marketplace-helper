@@ -120,45 +120,53 @@ def try_fill(page, label_candidates, value) -> bool:
 
 
 def fill_location(page, data) -> None:
-    """Type the street name into the location field and pick the first suggestion.
+    """Type the city (or street) into the location field and pick the first suggestion.
 
-    Diagnostic confirmed: Facebook's location input has no label, placeholder,
-    or aria-label -- random id each render. Only reliable method: try each
-    visible empty text input until one produces an autocomplete dropdown.
+    Facebook Marketplace's location input has no stable label — we probe each
+    visible empty text input. We try the city name first (most reliable for
+    Marketplace autocomplete), then street name, then full street as fallbacks.
     """
-    query = data.street_name or data.city or data.street
-    if not query:
+    # Build a priority list of queries to try — city first (most reliable).
+    queries = []
+    if data.city:
+        queries.append(data.city)
+    if data.street_name and data.street_name.lower() != (data.city or "").lower():
+        queries.append(data.street_name)
+    if data.street and data.street.lower() != (data.street_name or "").lower():
+        queries.append(data.street)
+    if not queries:
         return
 
-    all_inputs = page.locator("input[type='text'], input:not([type])").all()
-    for inp in all_inputs:
-        try:
-            if not inp.is_visible():
+    def _try_query(query):
+        """Try one query string; return True if an autocomplete option was clicked."""
+        all_inputs = page.locator("input[type='text'], input:not([type])").all()
+        for inp in all_inputs:
+            try:
+                if not inp.is_visible():
+                    continue
+                if (inp.get_attribute("aria-label") or "").lower() == "search facebook":
+                    continue
+                if inp.input_value():
+                    continue
+                inp.click()
+                page.wait_for_timeout(400)
+                inp.press_sequentially(query, delay=80)
+                page.wait_for_timeout(2500)
+                options = page.get_by_role("option").all()
+                if options:
+                    options[0].click()
+                    print(f"  + Location set: {options[0].text_content()[:60]}")
+                    return True
+                inp.fill("")
+            except Exception:
                 continue
-            # Skip the Facebook global search bar.
-            if (inp.get_attribute("aria-label") or "").lower() == "search facebook":
-                continue
-            # Skip inputs that already have a value (already filled fields).
-            if inp.input_value():
-                continue
+        return False
 
-            inp.click()
-            page.wait_for_timeout(400)
-            inp.press_sequentially(query, delay=80)
-            page.wait_for_timeout(2500)
+    for q in queries:
+        if _try_query(q):
+            return
 
-            options = page.get_by_role("option").all()
-            if options:
-                options[0].click()
-                print(f"  + Location set: {options[0].text_content()[:60]}")
-                return
-
-            # No autocomplete -- clear and try the next input.
-            inp.fill("")
-        except Exception:
-            continue
-
-    # Autocomplete didn't trigger — check if Facebook auto-filled the field anyway.
+    # Last check: Facebook may have auto-filled the city already.
     city = (data.city or "").lower()
     if city:
         for inp in page.locator("input[type='text'], input:not([type])").all():
@@ -324,21 +332,31 @@ def save_draft(page) -> bool:
     Returns True on success. Called BEFORE closing the browser context
     so the click has time to complete.
     """
-    page.wait_for_timeout(2500)   # let photo uploads settle
-    # Try every label variant Facebook has used for this button.
-    for name in ("Save draft", "Save Draft", "Save as draft"):
+    page.wait_for_timeout(4000)   # let photo uploads fully settle
+
+    # Facebook has used several different labels for this button over time.
+    button_names = ("Save draft", "Save Draft", "Save as draft",
+                    "Save as Draft", "Save listing", "Save")
+
+    for name in button_names:
         for locator in (
             page.get_by_role("button", name=name, exact=False),
             page.get_by_text(name, exact=False),
         ):
             try:
-                if locator.count() > 0:
-                    locator.first.click(timeout=6000)
-                    page.wait_for_timeout(2500)   # wait for FB to confirm the save
-                    print("  ✅ Draft saved — go to Marketplace → Selling → Drafts to publish.")
-                    return True
+                if locator.count() == 0:
+                    continue
+                btn = locator.first
+                # Scroll it into view in case it's below the fold.
+                btn.scroll_into_view_if_needed(timeout=3000)
+                page.wait_for_timeout(500)
+                btn.click(timeout=6000)
+                page.wait_for_timeout(4000)   # wait for FB to confirm the save
+                print("  ✅ Draft saved — go to Marketplace → Selling → Drafts to publish.")
+                return True
             except Exception:
                 continue
+
     print("  ! Couldn't click Save draft automatically — click it manually in the browser.")
     return False
 
