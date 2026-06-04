@@ -25,7 +25,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -213,34 +213,54 @@ def _realm_description_from_html(html_str: str) -> str:
     return ""
 
 
+def _pick(*values) -> str:
+    """Return the first non-empty string from the given values."""
+    for v in values:
+        s = str(v).strip() if v or v == 0 else ""
+        if s and s != "0":
+            return s
+    return ""
+
+
 def fetch_realm(url: str) -> ListingData:
     """Fetch a Realm MLP portal listing by intercepting its API responses.
 
-    The portal is a React SPA -- the page HTML is just a shell. The real data
-    arrives in two JSON API calls after page load:
-      1. /shared/...  -- portal view with title, meta (price/type), html (remarks)
-      2. /search?listingID=... -- search results with full image URLs, street, city
+    Both URL formats Realm uses return a portal blob that always contains:
+      - top-level: title, meta (price/type), html (remarks), images, imageSets
+      - portal_blob["summary"]: streetAddress, city, bedrooms, bathrooms,
+        listPrice, typeName, squareFeet, listingID
 
-    We capture both, extract from each, and merge the best fields.
+    The old ?active= format also fires a separate searchResults API call.
+    We use portal_blob["summary"] as the primary source for all formats,
+    and searchResults as a secondary source when available.
     """
-    from urllib.parse import urlparse, parse_qs
-
-    # Extract the active listing ID from the URL — two formats Realm uses:
-    #   Old: ?active=TREB-N13173246   (shared portal with multiple listings)
-    #   New: /view/listing/TREB-N13171452  (direct listing view)
+    # ---- Extract active listing ID from the URL ----------------------------
+    # Handles all known Realm URL formats:
+    #   ?active=TREB-N13173246          (old shared portal, query param)
+    #   /view/listing/TREB-N13171452    (new direct view, with board prefix)
+    #   /view/listing/N13171452         (new direct view, no prefix)
     parsed_url = urlparse(url)
-    parsed_qs = parse_qs(parsed_url.query)
-    active_param = parsed_qs.get("active", [""])[0]
-    active_id = active_param.split("-", 1)[-1] if "-" in active_param else active_param
+    qs = parse_qs(parsed_url.query)
+    active_id = ""
+    active_param = qs.get("active", [""])[0]
+    if active_param:
+        # Strip board prefix: TREB-N13173246 → N13173246
+        active_id = active_param.split("-", 1)[-1] if "-" in active_param else active_param
     if not active_id:
-        # New URL format: extract from path e.g. /view/listing/TREB-N13171452
-        path_match = re.search(r"/listing/([A-Z]+-\w+)", parsed_url.path)
-        if path_match:
-            active_id = path_match.group(1).split("-", 1)[-1]  # strip prefix → N13171452
+        # Path: /view/listing/TREB-N13171452 or /view/listing/N13171452
+        m = re.search(r"/listing/(?:[A-Z]+-)?(\w+)", parsed_url.path)
+        if m:
+            active_id = m.group(1)
+    if not active_id:
+        # Last resort: any board-prefixed ID anywhere in the path
+        m = re.search(r"/([A-Z]{2,6}-[A-Z]\d+)", parsed_url.path)
+        if m:
+            active_id = m.group(1).split("-", 1)[-1]
+    realm_base = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
     data = ListingData(source_url=url)
-    portal_blob: dict = {}    # /shared/... response
-    search_item: dict = {}    # the matched listing from /search response
+    portal_blob: dict = {}
+    search_item: dict = {}
     captured_html = ""
 
     with sync_playwright() as p:
@@ -258,15 +278,21 @@ def fetch_realm(url: str) -> ListingData:
                 if not body:
                     return
                 blob = json.loads(body.decode("utf-8", errors="ignore"))
+                if not isinstance(blob, dict):
+                    return
             except Exception:
                 return
 
-            # Portal view response: has 'title', 'meta', 'html', 'summary' keys.
-            if isinstance(blob, dict) and "meta" in blob and "html" in blob:
-                portal_blob = blob
+            # Portal blob: always has html (remarks). May also have summary,
+            # meta, images, imageSets. Accept if it has any two of these.
+            portal_signals = {"html", "meta", "summary", "imageSets", "images"}
+            if len(portal_signals & set(blob.keys())) >= 2:
+                # Prefer the one with 'html' (has description) if we have a choice.
+                if not portal_blob or "html" in blob:
+                    portal_blob = blob
 
-            # Search results response: has 'searchResults.data' list.
-            if isinstance(blob, dict) and "searchResults" in blob:
+            # Search results blob (old format only).
+            if "searchResults" in blob:
                 items = blob["searchResults"].get("data") or []
                 if items and isinstance(items[0], dict):
                     matched = None
@@ -276,20 +302,6 @@ def fetch_realm(url: str) -> ListingData:
                             matched = item
                             break
                     search_item = matched or items[0]
-
-            # Single-listing response (new /view/listing/... route).
-            # Shows up as a flat dict with listing fields OR nested under a key.
-            for key in ("listing", "listingData", "data", "result"):
-                if isinstance(blob, dict) and key in blob and isinstance(blob[key], dict):
-                    candidate = blob[key]
-                    if any(f in candidate for f in ("listingID", "streetAddress", "listPrice", "images")):
-                        if not search_item:
-                            search_item = candidate
-                        break
-            # Also accept a flat blob that looks like a listing dict directly.
-            if not search_item and isinstance(blob, dict):
-                if any(f in blob for f in ("streetAddress", "listPrice", "images", "bedrooms")):
-                    search_item = blob
 
         page.on("response", on_response)
         try:
@@ -303,80 +315,80 @@ def fetch_realm(url: str) -> ListingData:
             context.close()
             browser.close()
 
-    # ---- Pull fields from the responses ------------------------------------
-    # For the old shared-portal URL, data comes from two blobs:
-    #   portal_blob  → title, meta (price/type), html (remarks), images
-    #   search_item  → streetAddress, city, bedrooms, bathrooms, images
-    # For the new /view/listing/ URL, everything is in portal_blob, with
-    # detailed fields nested under portal_blob["summary"].
-    summary = portal_blob.get("summary") or {}  # new format nested fields
+    # ---- Extract fields ----------------------------------------------------
+    # summary (inside portal_blob) is the primary source for both URL formats.
+    # search_item (from searchResults) is secondary — only present in old format.
+    summary = portal_blob.get("summary") or {}
+    meta    = portal_blob.get("meta")    or {}
 
-    # Title: top-level in portal blob, or build from address.
-    data.title = (portal_blob.get("title") or "").strip()
+    data.title = _pick(portal_blob.get("title"), search_item.get("title"))
 
-    # Street + city: search result (old) or summary (new).
-    data.street = (search_item.get("streetAddress") or summary.get("streetAddress") or "").strip()
-    data.city   = (search_item.get("city")          or summary.get("city")          or "").strip()
+    data.street = _pick(summary.get("streetAddress"), search_item.get("streetAddress"))
+    data.city   = _pick(summary.get("city"), search_item.get("city"),
+                        summary.get("municipality"), search_item.get("municipality"))
     if not data.street and data.title:
         data.street, data.city = _split_address(data.title)
 
-    # Street name without house number.
-    raw_street_name = (search_item.get("streetName") or summary.get("streetName") or "").strip()
-    if raw_street_name:
-        data.street_name = raw_street_name
-    elif data.street:
-        data.street_name = re.sub(r"^\d+\s*", "", data.street).strip()
+    raw_sn = _pick(summary.get("streetName"), search_item.get("streetName"))
+    data.street_name = raw_sn if raw_sn else re.sub(r"^\d+\s*", "", data.street).strip()
 
-    # Price.
-    price_num = (search_item.get("listPrice") or search_item.get("price")
-                 or summary.get("listPrice") or summary.get("price") or "")
-    price_fmt = (search_item.get("listPriceFormatted")
-                 or summary.get("listPriceFormatted")
-                 or portal_blob.get("meta", {}).get("price") or "")
-    data.price, data.raw_price = _clean_price(price_fmt or str(price_num))
+    price_num = _pick(summary.get("listPrice"), summary.get("price"),
+                      search_item.get("listPrice"), search_item.get("price"))
+    price_fmt = _pick(summary.get("listPriceFormatted"), search_item.get("listPriceFormatted"),
+                      meta.get("price"))
+    data.price, data.raw_price = _clean_price(price_fmt or price_num)
 
-    # Type: sale vs rent.
-    sale_or_rent = (
-        search_item.get("saleOrRent")
-        or summary.get("saleOrRent")
-        or portal_blob.get("meta", {}).get("saleOrRent")
-        or "SALE"
-    ).lower()
-    data.listing_type = "rent" if any(w in sale_or_rent for w in ("rent", "lease")) else "sale"
+    sale_or_rent = _pick(summary.get("saleOrRent"), search_item.get("saleOrRent"),
+                         meta.get("saleOrRent")) or "SALE"
+    data.listing_type = "rent" if any(w in sale_or_rent.lower() for w in ("rent","lease")) else "sale"
 
-    # Description.
     data.description = _realm_description_from_html(portal_blob.get("html", ""))
 
-    # Bedrooms / bathrooms -- check search_item first (old), then summary (new).
-    beds = search_item.get("bedrooms", "") or summary.get("bedrooms", "")
-    beds_extra = search_item.get("bedroomsPossible", 0) or summary.get("bedroomsPossible", 0)
-    total_beds = (int(beds) + int(beds_extra or 0)) if beds else 0
+    beds = _pick(summary.get("bedrooms"), search_item.get("bedrooms"))
+    beds_extra = int(summary.get("bedroomsPossible") or search_item.get("bedroomsPossible") or 0)
+    try:
+        total_beds = (int(beds) + beds_extra) if beds else 0
+    except (ValueError, TypeError):
+        total_beds = 0
     data.bedrooms = str(total_beds) if total_beds > 0 else ""
-    baths = int(search_item.get("bathrooms", "") or summary.get("bathrooms", "") or 0)
-    data.bathrooms = str(baths) if baths > 0 else ""
-    data.property_type = _realm_type_to_fb(
-        search_item.get("typeName", "") or summary.get("typeName", ""))
-    sq = search_item.get("squareFeet", "") or summary.get("squareFeet", "") or ""
-    data.square_feet = re.sub(r"[^\d]", "", str(sq).split("-")[0]) if sq else ""
 
-    # Photos: prefer search_item images (old), fall back to portal_blob images (new).
-    raw_photos = (search_item.get("images")
-                  or portal_blob.get("images")
-                  or summary.get("images") or [])
-    realm_base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
-    for p in raw_photos:
-        raw_u = ""
-        if isinstance(p, str):
-            raw_u = p
-        elif isinstance(p, dict):
-            raw_u = p.get("url") or ""
-        if not raw_u:
-            continue
-        # Make relative URLs absolute using the Realm domain.
-        if raw_u.startswith("/"):
-            raw_u = realm_base + raw_u
-        if raw_u.startswith("http"):
-            data.photos.append(_fullres_photo_url(raw_u))
+    baths_raw = _pick(summary.get("bathrooms"), search_item.get("bathrooms"),
+                      summary.get("bathroomsTotal"), search_item.get("bathroomsTotal"))
+    try:
+        baths = int(float(baths_raw)) if baths_raw else 0
+    except (ValueError, TypeError):
+        baths = 0
+    data.bathrooms = str(baths) if baths > 0 else ""
+
+    type_name = _pick(summary.get("typeName"), search_item.get("typeName"),
+                      summary.get("propertyType"), search_item.get("propertyType"))
+    data.property_type = _realm_type_to_fb(type_name)
+
+    sq_raw = _pick(summary.get("squareFeet"), search_item.get("squareFeet"),
+                   summary.get("sqft"), search_item.get("sqft"))
+    data.square_feet = re.sub(r"[^\d]", "", str(sq_raw).split("-")[0]) if sq_raw else ""
+
+    # ---- Photos ------------------------------------------------------------
+    # Priority: search_item images (absolute CDN URLs, old format)
+    #         → portal_blob["images"] (relative /i/... paths, both formats)
+    #         → portal_blob["imageSets"] (structured, both formats)
+    def _add_photos(source):
+        for p in (source or []):
+            raw_u = p if isinstance(p, str) else _pick(
+                p.get("url") if isinstance(p, dict) else "",
+                p.get("src") if isinstance(p, dict) else "",
+                p.get("downloadUrl") if isinstance(p, dict) else "",
+            )
+            if not raw_u:
+                continue
+            if raw_u.startswith("/"):
+                raw_u = realm_base + raw_u
+            if raw_u.startswith("http"):
+                data.photos.append(_fullres_photo_url(raw_u))
+
+    _add_photos(search_item.get("images"))
+    _add_photos(portal_blob.get("images"))
+    _add_photos(portal_blob.get("imageSets"))
     data.photos = _dedupe_photos(data.photos)
 
     # Fallback: if we got almost nothing, try the standard HTML extractors.
