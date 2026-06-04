@@ -266,7 +266,11 @@ def fill_marketplace_form(page, data, description) -> None:
     the price correctly (not as a monthly rental amount).
     """
 
-    # 1. Property type dropdown (Townhouse, House, Condo, etc.)
+    # 1. Title -- fill first so it doesn't get clobbered by later field clicks.
+    if data.title:
+        try_fill(page, LABELS["title"], data.title)
+
+    # 2. Property type dropdown (Townhouse, House, Condo, etc.)
     if data.property_type:
         select_dropdown(page, ["Property type", "Home type", "Type"], data.property_type)
         page.wait_for_timeout(500)

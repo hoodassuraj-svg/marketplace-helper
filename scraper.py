@@ -214,10 +214,16 @@ def _realm_description_from_html(html_str: str) -> str:
 
 
 def _pick(*values) -> str:
-    """Return the first non-empty string from the given values."""
+    """Return the first non-empty, non-None value as a stripped string.
+
+    Skips None, empty strings, and whitespace-only strings.
+    Does NOT skip "0" — callers that want to skip zero handle it themselves.
+    """
     for v in values:
-        s = str(v).strip() if v or v == 0 else ""
-        if s and s != "0":
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
             return s
     return ""
 
@@ -283,13 +289,12 @@ def fetch_realm(url: str) -> ListingData:
             except Exception:
                 return
 
-            # Portal blob: always has html (remarks). May also have summary,
-            # meta, images, imageSets. Accept if it has any two of these.
-            portal_signals = {"html", "meta", "summary", "imageSets", "images"}
-            if len(portal_signals & set(blob.keys())) >= 2:
-                # Prefer the one with 'html' (has description) if we have a choice.
-                if not portal_blob or "html" in blob:
-                    portal_blob = blob
+            # Portal blob: reliably identified by having BOTH "html" (remarks)
+            # AND at least one of the structured-data keys. Requiring "html"
+            # prevents analytics/search blobs (which share meta/images keys)
+            # from being mistakenly accepted as the portal blob.
+            if "html" in blob and any(k in blob for k in ("summary", "meta", "imageSets", "images")):
+                portal_blob = blob
 
             # Search results blob (old format only).
             if "searchResults" in blob:
@@ -345,11 +350,11 @@ def fetch_realm(url: str) -> ListingData:
     data.description = _realm_description_from_html(portal_blob.get("html", ""))
 
     beds = _pick(summary.get("bedrooms"), search_item.get("bedrooms"))
-    beds_extra = int(summary.get("bedroomsPossible") or search_item.get("bedroomsPossible") or 0)
     try:
+        beds_extra = int(summary.get("bedroomsPossible") or search_item.get("bedroomsPossible") or 0)
         total_beds = (int(beds) + beds_extra) if beds else 0
     except (ValueError, TypeError):
-        total_beds = 0
+        total_beds = int(beds) if beds and str(beds).isdigit() else 0
     data.bedrooms = str(total_beds) if total_beds > 0 else ""
 
     baths_raw = _pick(summary.get("bathrooms"), search_item.get("bathrooms"),
