@@ -225,11 +225,18 @@ def fetch_realm(url: str) -> ListingData:
     """
     from urllib.parse import urlparse, parse_qs
 
-    # Parse which listing is 'active' from the URL, e.g. active=TREB-N13173246 → N13173246
-    # This is critical when the URL contains multiple listing IDs.
-    parsed_qs = parse_qs(urlparse(url).query)
-    active_param = parsed_qs.get("active", [""])[0]          # e.g. "TREB-N13173246"
+    # Extract the active listing ID from the URL — two formats Realm uses:
+    #   Old: ?active=TREB-N13173246   (shared portal with multiple listings)
+    #   New: /view/listing/TREB-N13171452  (direct listing view)
+    parsed_url = urlparse(url)
+    parsed_qs = parse_qs(parsed_url.query)
+    active_param = parsed_qs.get("active", [""])[0]
     active_id = active_param.split("-", 1)[-1] if "-" in active_param else active_param
+    if not active_id:
+        # New URL format: extract from path e.g. /view/listing/TREB-N13171452
+        path_match = re.search(r"/listing/([A-Z]+-\w+)", parsed_url.path)
+        if path_match:
+            active_id = path_match.group(1).split("-", 1)[-1]  # strip prefix → N13171452
 
     data = ListingData(source_url=url)
     portal_blob: dict = {}    # /shared/... response
@@ -262,8 +269,6 @@ def fetch_realm(url: str) -> ListingData:
             if isinstance(blob, dict) and "searchResults" in blob:
                 items = blob["searchResults"].get("data") or []
                 if items and isinstance(items[0], dict):
-                    # Pick the item matching the 'active' listing ID in the URL,
-                    # not always items[0] (which would always be the first listing).
                     matched = None
                     for item in items:
                         item_id = str(item.get("listingID", "") or item.get("_id", ""))
@@ -271,6 +276,20 @@ def fetch_realm(url: str) -> ListingData:
                             matched = item
                             break
                     search_item = matched or items[0]
+
+            # Single-listing response (new /view/listing/... route).
+            # Shows up as a flat dict with listing fields OR nested under a key.
+            for key in ("listing", "listingData", "data", "result"):
+                if isinstance(blob, dict) and key in blob and isinstance(blob[key], dict):
+                    candidate = blob[key]
+                    if any(f in candidate for f in ("listingID", "streetAddress", "listPrice", "images")):
+                        if not search_item:
+                            search_item = candidate
+                        break
+            # Also accept a flat blob that looks like a listing dict directly.
+            if not search_item and isinstance(blob, dict):
+                if any(f in blob for f in ("streetAddress", "listPrice", "images", "bedrooms")):
+                    search_item = blob
 
         page.on("response", on_response)
         try:
