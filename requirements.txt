@@ -1,0 +1,13 @@
+# ---------------------------------------------------------------------------
+# Dependencies for the Marketplace Listing Helper
+#
+# Install everything with:
+#     pip install -r requirements.txt
+#     playwright install chromium      # one-time: downloads the browser
+# ---------------------------------------------------------------------------
+
+playwright==1.47.0          # Browser automation: scraping + Marketplace form-fill
+beautifulsoup4==4.12.3      # HTML parsing (the scraping fallback layer)
+lxml==5.3.0                 # Fast parser backend for BeautifulSoup
+python-dotenv==1.0.1        # Loads optional settings from .env
+requests==2.32.3            # Downloads listing photos to a temp folder

@@ -1,0 +1,18 @@
+# Secrets / session -- never commit these
+.env
+.fb_profile/
+
+# Runtime artifacts
+_temp_photos/
+log.txt
+launch_error.log
+.first_run_setup.command
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store

@@ -1,0 +1,28 @@
+MARKETPLACE HELPER — HOW TO START
+==================================
+
+EASIEST WAY (always works):
+  Double-click "Run App.command".
+  - The first time, it sets itself up automatically (takes about a
+    minute), then the app opens.
+  - It also repairs the "Marketplace Helper" icon so you can use that
+    from then on.
+  - If you see "cannot be opened because it is from an unidentified
+    developer", right-click "Run App.command" > Open > Open. You only
+    do this once.
+
+USING THE APP ICON ("Marketplace Helper"):
+  macOS blocks apps from the internet on a normal double-click, so the
+  FIRST time:
+    1. RIGHT-CLICK (or Control-click) "Marketplace Helper"
+    2. Choose "Open"
+    3. Click "Open" again in the popup
+  After that, a normal double-click works every time.
+
+  If right-click > Open still does nothing, just use
+  "Run App.command" instead (see above) — it does the same thing and
+  fixes the icon.
+
+STILL STUCK?
+  Open System Settings > Privacy & Security, scroll down, and click
+  "Open Anyway" next to the Marketplace Helper message.
