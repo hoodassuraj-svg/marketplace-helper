@@ -374,27 +374,64 @@ def fetch_realm(url: str) -> ListingData:
     data.square_feet = re.sub(r"[^\d]", "", str(sq_raw).split("-")[0]) if sq_raw else ""
 
     # ---- Photos ------------------------------------------------------------
-    # Priority: search_item images (absolute CDN URLs, old format)
-    #         → portal_blob["images"] (relative /i/... paths, both formats)
-    #         → portal_blob["imageSets"] (structured, both formats)
-    def _add_photos(source):
-        for p in (source or []):
-            raw_u = p if isinstance(p, str) else _pick(
-                p.get("url") if isinstance(p, dict) else "",
-                p.get("src") if isinstance(p, dict) else "",
-                p.get("downloadUrl") if isinstance(p, dict) else "",
-            )
-            if not raw_u:
-                continue
-            if raw_u.startswith("/"):
-                raw_u = realm_base + raw_u
-            if raw_u.startswith("http"):
-                data.photos.append(_fullres_photo_url(raw_u))
+    # IMPORTANT: every photo is published under *two* different CDN URLs:
+    #   - portal_blob["images"] / imageSets[*]["url"]: a /i/... imgproxy path
+    #     served off the portal host (session-tied, transform baked in)
+    #   - imageSets[*]["sizes"]: public stratuscollab CDN URLs whose last
+    #     path segment base64-decodes to the full-res TRREB/ampre original
+    # Collecting from more than one of these double-counts each photo, so a
+    # 27-photo listing becomes 54 URLs and Facebook's 50-photo cap fills up
+    # with duplicates (or drops real photos). We therefore take exactly ONE
+    # canonical, publicly-downloadable, full-res URL per photo.
+    #
+    # imageSets is the richest source and is present in BOTH URL formats, so
+    # it is the primary. search_item/images are fallbacks only when a listing
+    # has no imageSets.
+    def _imageset_url(item):
+        """Best full-res, publicly downloadable URL for one imageSets entry."""
+        if not isinstance(item, dict):
+            return item if isinstance(item, str) else ""
+        sizes = item.get("sizes") or {}
+        if sizes:
+            # Any size decodes to the same 1920px original; pick the largest
+            # so the resize-bump fallback (if decoding fails) is highest res.
+            try:
+                biggest = sizes[max(sizes, key=lambda k: int(k))]
+            except (ValueError, TypeError):
+                biggest = next(iter(sizes.values()), "")
+            if biggest:
+                return _fullres_photo_url(biggest)
+        # No sizes: fall back to the proxy URL (resolved/decoded below).
+        return _pick(item.get("downloadUrl"), item.get("url"))
 
-    _add_photos(search_item.get("images"))
-    _add_photos(portal_blob.get("images"))
-    _add_photos(portal_blob.get("imageSets"))
-    data.photos = _dedupe_photos(data.photos)
+    collected = []
+    image_sets = portal_blob.get("imageSets") or []
+    if image_sets:
+        collected = [_imageset_url(it) for it in image_sets]
+    else:
+        # Fallback for listings without imageSets: plain image lists.
+        def _plain_url(p):
+            if isinstance(p, str):
+                return p
+            if isinstance(p, dict):
+                return _pick(p.get("url"), p.get("src"), p.get("downloadUrl"))
+            return ""
+        for source in (search_item.get("images"), portal_blob.get("images")):
+            for p in (source or []):
+                u = _plain_url(p)
+                if u:
+                    collected.append(_fullres_photo_url(u))
+
+    # Resolve relative /i/... proxy paths against the portal host.
+    resolved = []
+    for u in collected:
+        u = (u or "").strip()
+        if u.startswith("/"):
+            u = realm_base + u
+        if u.startswith("http"):
+            resolved.append(u)
+
+    data.photos = _dedupe_photos(resolved)
 
     # Fallback: if we got almost nothing, try the standard HTML extractors.
     if not data.title and not data.street:
@@ -453,14 +490,32 @@ def _normalize_images(img) -> list:
     return out
 
 
+def _photo_identity(u: str) -> str:
+    """A stable key for the underlying photo, ignoring CDN/transform wrapping.
+
+    The same image is served under several URLs (full-res ampre, stratuscollab
+    resize proxy, portal /i/ proxy). For ampre originals the first path segment
+    is a content hash that is unique per image -- dedupe on that so the same
+    photo coming from two sources collapses to one. Otherwise fall back to the
+    URL itself.
+    """
+    m = re.search(r"ampre\.ca/([A-Za-z0-9_-]{16,})", u)
+    if m:
+        return m.group(1)
+    return u
+
+
 def _dedupe_photos(urls: list) -> list:
     """Drop duplicates and obvious non-photos (icons, blanks)."""
     seen, out = set(), []
     for u in urls:
         u = (u or "").strip()
-        if not u or u in seen or u.lower().endswith(".svg"):
+        if not u or u.lower().endswith(".svg"):
             continue
-        seen.add(u)
+        key = _photo_identity(u)
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(u)
     return out
 
