@@ -282,7 +282,9 @@ def _run_poster(url: str) -> str:
     try:
         import config, scraper
         from poster import (get_listing, fill_marketplace_form, save_draft,
-                            log_result, cleanup, MARKETPLACE_CREATE_URL, select_dropdown)
+                            log_result, cleanup, MARKETPLACE_CREATE_URL,
+                            select_dropdown, open_named_combobox)
+        from tracer import Tracer
         from playwright.sync_api import sync_playwright
     except Exception as e:
         print(f"❌ Import error: {e}\n"
@@ -306,6 +308,8 @@ def _run_poster(url: str) -> str:
     print(f"✅ {len(data.photo_paths)} photos ready.\n")
 
     result = "fail"
+    tracer = Tracer()   # records each step + dumps the page when something breaks
+    page = None
     try:
         with sync_playwright() as p:
             ctx = p.chromium.launch_persistent_context(
@@ -313,44 +317,58 @@ def _run_poster(url: str) -> str:
                 viewport={"width": 1280, "height": 900})
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
-            if "login" in page.url or page.locator("input[name='email']").count() > 0:
-                print(">>> Please log into Facebook in the browser.")
-                _ask("Log into Facebook in the browser,\nthen click OK to continue.")
+            with tracer.step("Open Facebook / login check"):
+                page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                if "login" in page.url or page.locator("input[name='email']").count() > 0:
+                    print(">>> Please log into Facebook in the browser.")
+                    _ask("Log into Facebook in the browser,\nthen click OK to continue.")
 
-            print("Opening Facebook Marketplace…")
-            page.goto(MARKETPLACE_CREATE_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
+            with tracer.step("Open Marketplace + pick Home category"):
+                print("Opening Facebook Marketplace…")
+                page.goto(MARKETPLACE_CREATE_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
 
-            tile = page.get_by_text("Home for sale or rent", exact=False)
-            if tile.count() == 0:
-                for lbl in ("Home for Sale or Rent", "Property for sale"):
-                    tile = page.get_by_text(lbl, exact=False)
-                    if tile.count(): break
-            if tile.count():
-                tile.first.click(); page.wait_for_timeout(2500)
-            else:
-                _ask("Click 'Home for sale or rent' in the browser, then click OK.")
+                tile = page.get_by_text("Home for sale or rent", exact=False)
+                if tile.count() == 0:
+                    for lbl in ("Home for Sale or Rent", "Property for sale"):
+                        tile = page.get_by_text(lbl, exact=False)
+                        if tile.count(): break
+                if tile.count():
+                    tile.first.click(); page.wait_for_timeout(2500)
+                else:
+                    print("  ! Couldn't find the Home tile — capturing the page.")
+                    tracer.snapshot_fields(page, "no_home_tile")
+                    tracer.dump(page, "no_home_tile")
+                    _ask("Click 'Home for sale or rent' in the browser, then click OK.")
 
-            sor = "For Rent" if data.listing_type == "rent" else "For Sale"
-            page.wait_for_timeout(1000)
-            if not select_dropdown(page, ["Home for Sale or Rent", "Sale or Rent"], sor):
-                try:
-                    page.locator("[role='combobox']").first.click()
-                    page.wait_for_timeout(800)
-                    page.get_by_role("option", name=sor).first.click()
-                except Exception:
-                    print(f"  ! Set '{sor}' manually in the browser.")
-            page.wait_for_timeout(1500)
+            with tracer.step("Set Sale/Rent type"):
+                sor = "For Rent" if data.listing_type == "rent" else "For Sale"
+                page.wait_for_timeout(1000)
+                ok = select_dropdown(page, ["Home for Sale or Rent", "Sale or Rent"], sor)
+                if not ok:
+                    # Open the listing-type combobox BY NAME (never the Search box).
+                    if open_named_combobox(page, ["home for sale or rent", "sale or rent"]):
+                        page.wait_for_timeout(800)
+                        try:
+                            page.get_by_role("option", name=sor).first.click()
+                            ok = True
+                        except Exception:
+                            print(f"  ! Set '{sor}' manually in the browser.")
+                    else:
+                        print(f"  ! Set '{sor}' manually in the browser.")
+                tracer.field("sale_or_rent", ok)
+                page.wait_for_timeout(1500)
 
             print("Filling form fields…")
-            fill_marketplace_form(page, data, description)
+            fill_marketplace_form(page, data, description, tracer)
 
             # Save draft BEFORE closing the context — gives FB time to register the click.
-            print("Saving as draft…")
-            saved = save_draft(page)
-            page.wait_for_timeout(2000)   # extra buffer after save
+            saved = False
+            with tracer.step("Save draft"):
+                print("Saving as draft…")
+                saved = save_draft(page)
+                page.wait_for_timeout(2000)   # extra buffer after save
 
             if saved:
                 result = "success"
@@ -358,7 +376,9 @@ def _run_poster(url: str) -> str:
 
     except Exception as e:
         print(f"❌ Error during Facebook step: {e}")
+        tracer.dump(page, "error")
     finally:
+        tracer.summary()
         log_result(url, result)
         cleanup()
 

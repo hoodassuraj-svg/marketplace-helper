@@ -4,6 +4,7 @@
 
 # Runtime artifacts
 _temp_photos/
+_debug/
 log.txt
 launch_error.log
 .first_run_setup.command

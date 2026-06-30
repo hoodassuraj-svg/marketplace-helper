@@ -22,6 +22,7 @@ from datetime import datetime
 
 import config
 import scraper
+from tracer import Tracer
 
 try:
     from playwright.sync_api import sync_playwright
@@ -62,9 +63,16 @@ def get_args() -> tuple:
     parser.add_argument("url", nargs="?", help="Listing URL to scrape")
     parser.add_argument("--manual", action="store_true",
                         help="Skip scraping; type the details yourself")
+    parser.add_argument("--inspect", action="store_true",
+                        help="Diagnostic: open the Marketplace create page and dump "
+                             "every visible field label + a screenshot, then exit. "
+                             "Use this to see what Facebook renamed when filling stops working.")
     args = parser.parse_args()
+    # --inspect needs no listing URL.
+    if args.inspect:
+        return (args.url or "", args.manual, True)
     url = args.url or input("Paste the listing URL: ").strip()
-    return url, args.manual
+    return url, args.manual, False
 
 
 def _has_terminal() -> bool:
@@ -119,14 +127,58 @@ def try_fill(page, label_candidates, value) -> bool:
     return False
 
 
-def fill_location(page, data) -> None:
-    """Type the city (or street) into the location field and pick the first suggestion.
+def _is_search_box(locator) -> bool:
+    """True if a locator is Facebook's global 'Search Facebook' box.
 
-    Facebook Marketplace's location input has no stable label — we probe each
-    visible empty text input. We try the city name first (most reliable for
-    Marketplace autocomplete), then street name, then full street as fallbacks.
+    Critical: every blind 'first input/combobox' fallback used to land here,
+    which is what made the run wander into the search typeahead and stop
+    filling. We exclude it explicitly everywhere.
     """
-    # Build a priority list of queries to try — city first (most reliable).
+    try:
+        label = (locator.get_attribute("aria-label") or "").lower()
+    except Exception:
+        return False
+    return "search" in label
+
+
+def open_named_combobox(page, names) -> bool:
+    """Click the combobox whose accessible name matches one of `names`
+    (case-insensitive, partial). NEVER opens the global Search box.
+
+    Returns True if a matching combobox was found and clicked.
+    """
+    try:
+        combos = page.get_by_role("combobox").all()
+    except Exception:
+        combos = []
+    for c in combos:
+        try:
+            label = (c.get_attribute("aria-label") or c.inner_text() or "").strip().lower()
+        except Exception:
+            label = ""
+        if not label or "search" in label:
+            continue
+        if any(n.lower() in label for n in names):
+            try:
+                c.click()
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def fill_location(page, data) -> bool:
+    """Type the city into the location field and pick the first suggestion.
+
+    Facebook's redesigned home flow moved Location onto a LATER wizard step, so
+    on the first step there may be no location box at all. We therefore target a
+    real location/address field by its label (never the Search box). If none is
+    present we say so and return instead of typing the city into a random input
+    -- the old blind "first empty text input" probe is what used to dump the
+    query into the Search bar.
+
+    Returns True only if a location suggestion was actually selected.
+    """
     queries = []
     if data.city:
         queries.append(data.city)
@@ -135,48 +187,50 @@ def fill_location(page, data) -> None:
     if data.street and data.street.lower() != (data.street_name or "").lower():
         queries.append(data.street)
     if not queries:
-        return
+        return False
 
-    def _try_query(query):
-        """Try one query string; return True if an autocomplete option was clicked."""
-        all_inputs = page.locator("input[type='text'], input:not([type])").all()
-        for inp in all_inputs:
-            try:
-                if not inp.is_visible():
-                    continue
-                if (inp.get_attribute("aria-label") or "").lower() == "search facebook":
-                    continue
-                if inp.input_value():
-                    continue
-                inp.click()
-                page.wait_for_timeout(400)
-                inp.press_sequentially(query, delay=80)
-                page.wait_for_timeout(2500)
-                options = page.get_by_role("option").all()
-                if options:
-                    options[0].click()
-                    print(f"  + Location set: {options[0].text_content()[:60]}")
-                    return True
-                inp.fill("")
-            except Exception:
+    # Find a genuine location input by label/placeholder -- not the search box.
+    loc = None
+    for getter in (
+        lambda: page.get_by_label("Location", exact=False),
+        lambda: page.get_by_label("Address", exact=False),
+        lambda: page.get_by_label("City", exact=False),
+        lambda: page.get_by_placeholder("Location", exact=False),
+        lambda: page.get_by_placeholder("address", exact=False),
+        lambda: page.locator("input[aria-label*='ocation']"),
+        lambda: page.locator("input[aria-label*='ddress']"),
+    ):
+        try:
+            cand = getter().first
+            cand.wait_for(state="visible", timeout=1500)
+            if _is_search_box(cand):
                 continue
+            loc = cand
+            break
+        except Exception:
+            continue
+
+    if loc is None:
+        print("  ⚠ No Location field on this step — Facebook's new flow asks for "
+              "it after you click 'Next'. Set the city there.")
         return False
 
     for q in queries:
-        if _try_query(q):
-            return
+        try:
+            loc.click()
+            loc.fill("")
+            loc.press_sequentially(q, delay=80)
+            page.wait_for_timeout(2500)
+            options = page.get_by_role("option").all()
+            if options:
+                options[0].click()
+                print(f"  + Location set: {options[0].text_content()[:60]}")
+                return True
+        except Exception:
+            continue
 
-    # Last check: Facebook may have auto-filled the city already.
-    city = (data.city or "").lower()
-    if city:
-        for inp in page.locator("input[type='text'], input:not([type])").all():
-            try:
-                if city in (inp.input_value() or "").lower():
-                    return
-            except Exception:
-                continue
-
-    print("  ⚠ Location: type the street name in the browser.")
+    print("  ⚠ Location: type the city in the browser.")
+    return False
 
 
 def upload_photos(page, photo_paths) -> None:
@@ -267,58 +321,84 @@ def fill_number_input(page, label_candidates, value) -> bool:
     return False
 
 
-def fill_marketplace_form(page, data, description) -> None:
+def fill_marketplace_form(page, data, description, tracer=None) -> None:
     """Pre-fill every field on the Home for Sale/Rent create-listing page.
 
     Fill order matters: sale/rent type is set BEFORE price so Facebook formats
     the price correctly (not as a monthly rental amount).
+
+    `tracer` (a tracer.Tracer) records which fields filled vs. missed and, when
+    things go wrong, dumps the page so you can see why. It's optional so the
+    function still works without one.
     """
+    if tracer is None:
+        tracer = Tracer(enabled=False)
+
+    # Record what the form actually looks like RIGHT NOW. If everything below
+    # misses, this snapshot tells you which labels Facebook changed.
+    tracer.snapshot_fields(page, "before_fill")
+    tracer.dump(page, "before_fill")
 
     # 1. Title -- fill first so it doesn't get clobbered by later field clicks.
-    if data.title:
-        try_fill(page, LABELS["title"], data.title)
+    with tracer.step("Title"):
+        if data.title:
+            tracer.field("title", try_fill(page, LABELS["title"], data.title))
 
     # 2. Property type dropdown (Townhouse, House, Condo, etc.)
-    if data.property_type:
-        select_dropdown(page, ["Property type", "Home type", "Type"], data.property_type)
+    with tracer.step("Property type"):
+        if data.property_type:
+            tracer.field("property_type", select_dropdown(
+                page, ["Property type", "Home type", "Type"], data.property_type))
+            page.wait_for_timeout(500)
+
+    # 3. Bedrooms + bathrooms -- plain number inputs, not dropdowns.
+    with tracer.step("Bedrooms / Bathrooms"):
+        if data.bedrooms:
+            tracer.field("bedrooms", fill_number_input(
+                page, ["Number of bedrooms", "Bedrooms", "Beds"], data.bedrooms))
+        if data.bathrooms:
+            tracer.field("bathrooms", fill_number_input(
+                page, ["Number of bathrooms", "Bathrooms", "Baths"], data.bathrooms))
+
+    # 4. Price (after type is confirmed so FB knows sale vs. rent format).
+    with tracer.step("Price"):
+        tracer.field("price", try_fill(page, LABELS["price"], data.price))
+
+    # 5. Location -- street name only, no house number.
+    with tracer.step("Location"):
+        fill_location(page, data)
+
+    # 6. Description with branding.
+    with tracer.step("Description"):
+        tracer.field("description", try_fill(page, LABELS["description"], description))
+
+    # 7. Advanced details -- scroll down to make them visible first.
+    with tracer.step("Advanced details (laundry/parking/AC/heating)"):
+        page.evaluate("window.scrollBy(0, 600)")
+        page.wait_for_timeout(800)
+        tracer.field("laundry", select_dropdown(
+            page, ["Laundry type", "Laundry"], ADVANCED_DEFAULTS["laundry"]))
+        tracer.field("parking", select_dropdown(
+            page, ["Parking type", "Parking"], ADVANCED_DEFAULTS["parking"]))
+        tracer.field("ac", select_dropdown(
+            page, ["Air conditioning type", "Air conditioning", "AC type"],
+            ADVANCED_DEFAULTS["ac"]))
+        tracer.field("heating", select_dropdown(
+            page, ["Heating type", "Heating"], ADVANCED_DEFAULTS["heating"]))
+
+    # 8. Photos -- upload last so thumbnails don't push fields off screen mid-fill.
+    with tracer.step("Photos"):
+        page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(500)
+        before = len(data.photo_paths or [])
+        upload_photos(page, data.photo_paths)
+        tracer.field(f"photos ({before})", before > 0)
 
-    # 2. Bedrooms + bathrooms -- plain number inputs, not dropdowns.
-    if data.bedrooms:
-        fill_number_input(page, ["Number of bedrooms", "Bedrooms", "Beds"], data.bedrooms)
-    if data.bathrooms:
-        fill_number_input(page, ["Number of bathrooms", "Bathrooms", "Baths"], data.bathrooms)
-
-    # 3. Price (after type is confirmed so FB knows sale vs. rent format).
-    try_fill(page, LABELS["price"], data.price)
-
-    # 4. Location -- street name only, no house number.
-    fill_location(page, data)
-
-    # 5. Description with branding.
-    try_fill(page, LABELS["description"], description)
-
-    # 6. Advanced details -- scroll down to make them visible first.
-    page.evaluate("window.scrollBy(0, 600)")
-    page.wait_for_timeout(800)
-
-    select_dropdown(
-        page, ["Laundry type", "Laundry"], ADVANCED_DEFAULTS["laundry"]
-    )
-    select_dropdown(
-        page, ["Parking type", "Parking"], ADVANCED_DEFAULTS["parking"]
-    )
-    select_dropdown(
-        page, ["Air conditioning type", "Air conditioning", "AC type"], ADVANCED_DEFAULTS["ac"]
-    )
-    select_dropdown(
-        page, ["Heating type", "Heating"], ADVANCED_DEFAULTS["heating"]
-    )
-
-    # 7. Photos -- upload last so thumbnails don't push fields off screen mid-fill.
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(500)
-    upload_photos(page, data.photo_paths)
+    # If nothing filled, capture the page so the failure is inspectable.
+    if not any(ok for _, ok in tracer.fields):
+        tracer.log("\n  !! Every field missed -- capturing the page for diagnosis.")
+        tracer.snapshot_fields(page, "all_missed")
+        tracer.dump(page, "all_missed")
 
     # Photos done -- caller must call save_draft(page) after this returns.
 
@@ -409,8 +489,53 @@ def cleanup() -> None:
     shutil.rmtree(config.TEMP_PHOTO_DIR, ignore_errors=True)
 
 
+def inspect_create_page() -> None:
+    """Open the Marketplace create page and dump every visible field label +
+    a screenshot, then exit. Run this when filling stops working to see what
+    Facebook renamed -- no listing or scraping needed."""
+    tracer = Tracer()
+    print("Opening Facebook Marketplace create page for inspection...")
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            config.USER_DATA_DIR, headless=False,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+        if "login" in page.url or page.locator("input[name='email']").count() > 0:
+            print("\n>>> Please LOG INTO FACEBOOK in the open browser window.")
+            input(">>> Once you're on your home feed, press Enter here...")
+
+        page.goto(MARKETPLACE_CREATE_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+        tracer.snapshot_fields(page, "category_picker")
+        tracer.dump(page, "category_picker")
+
+        # Try to advance into the Home form so we can list ITS fields too.
+        home_tile = page.get_by_text("Home for sale or rent", exact=False)
+        if home_tile.count() > 0:
+            home_tile.first.click()
+            page.wait_for_timeout(2500)
+            tracer.snapshot_fields(page, "home_form")
+            tracer.dump(page, "home_form")
+        else:
+            print("  (Couldn't auto-find the 'Home for sale or rent' tile -- "
+                  "click it yourself, then press Enter to snapshot the form.)")
+            input("  Press Enter once the Home form is open... ")
+            tracer.snapshot_fields(page, "home_form")
+            tracer.dump(page, "home_form")
+
+        print("\nInspection done. Compare the labels above with LABELS in poster.py.")
+        input("Press Enter to close the browser... ")
+        context.close()
+
+
 def main() -> None:
-    url, manual = get_args()
+    url, manual, inspect = get_args()
+    if inspect:
+        inspect_create_page()
+        return
     if not url:
         print("No URL given. Exiting.")
         return
@@ -442,6 +567,8 @@ def main() -> None:
 
     # ---- 6) Open Facebook (persistent session) and fill the form -----------
     result = "fail"
+    tracer = Tracer()
+    page = None
     try:
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
@@ -452,54 +579,68 @@ def main() -> None:
             page = context.pages[0] if context.pages else context.new_page()
 
             # First-run login check.
-            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
-            if "login" in page.url or page.locator("input[name='email']").count() > 0:
-                print("\n>>> Please LOG INTO FACEBOOK in the open browser window.")
-                input(">>> Once you're on your Facebook home feed, press Enter here...")
+            with tracer.step("Open Facebook / login check"):
+                page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                if "login" in page.url or page.locator("input[name='email']").count() > 0:
+                    print("\n>>> Please LOG INTO FACEBOOK in the open browser window.")
+                    input(">>> Once you're on your Facebook home feed, press Enter here...")
 
             # Navigate to the category picker and click "Home for sale or rent".
             # This is more reliable than a direct URL (Facebook ignores them).
-            print("\nOpening Marketplace category picker...")
-            page.goto(MARKETPLACE_CREATE_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
+            with tracer.step("Open Marketplace category picker"):
+                print("\nOpening Marketplace category picker...")
+                page.goto(MARKETPLACE_CREATE_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
 
             # Click the "Home for sale or rent" tile (text seen in the UI).
-            home_tile = page.get_by_text("Home for sale or rent", exact=False)
-            if home_tile.count() == 0:
-                # Fallback label variants Facebook has used.
-                for label in ("Home for Sale or Rent", "Property for sale", "Real estate"):
-                    home_tile = page.get_by_text(label, exact=False)
-                    if home_tile.count() > 0:
-                        break
-            if home_tile.count() > 0:
-                home_tile.first.click()
-                page.wait_for_timeout(2500)
-                print("  Clicked 'Home for sale or rent' tile.")
-            else:
-                print("  ! Couldn't find the Home tile -- you may need to click it manually.")
-                input("  Click 'Home for sale or rent' in the browser, then press Enter...")
+            with tracer.step("Click 'Home for sale or rent' tile"):
+                home_tile = page.get_by_text("Home for sale or rent", exact=False)
+                if home_tile.count() == 0:
+                    # Fallback label variants Facebook has used.
+                    for label in ("Home for Sale or Rent", "Property for sale", "Real estate"):
+                        home_tile = page.get_by_text(label, exact=False)
+                        if home_tile.count() > 0:
+                            break
+                if home_tile.count() > 0:
+                    home_tile.first.click()
+                    page.wait_for_timeout(2500)
+                    print("  Clicked 'Home for sale or rent' tile.")
+                else:
+                    # This is a very common breakage point -- capture the page.
+                    print("  ! Couldn't find the Home tile -- capturing the page.")
+                    tracer.snapshot_fields(page, "no_home_tile")
+                    tracer.dump(page, "no_home_tile")
+                    input("  Click 'Home for sale or rent' in the browser, then press Enter...")
 
             # Set For Sale / For Rent BEFORE anything else so Facebook formats
             # the price field correctly (sale = total, rent = per month).
-            sale_or_rent_label = "For Rent" if data.listing_type == "rent" else "For Sale"
-            page.wait_for_timeout(1000)
-            success = select_dropdown(
-                page,
-                ["Home for Sale or Rent", "Sale or Rent", "Listing type"],
-                sale_or_rent_label,
-            )
-            if not success:
-                # Try clicking any visible combobox and picking from the list.
-                try:
-                    page.locator("[role='combobox']").first.click()
-                    page.wait_for_timeout(800)
-                    page.get_by_role("option", name=sale_or_rent_label).first.click()
-                except Exception:
-                    print(f"  ! Set '{sale_or_rent_label}' manually in the browser.")
-            page.wait_for_timeout(1500)  # let form re-render after type change
+            with tracer.step("Set Sale/Rent type"):
+                sale_or_rent_label = "For Rent" if data.listing_type == "rent" else "For Sale"
+                page.wait_for_timeout(1000)
+                success = select_dropdown(
+                    page,
+                    ["Home for Sale or Rent", "Sale or Rent", "Listing type"],
+                    sale_or_rent_label,
+                )
+                if not success:
+                    # Fallback: open the listing-type combobox BY NAME (never the
+                    # Search box) and pick the option.
+                    if open_named_combobox(
+                        page, ["home for sale or rent", "sale or rent", "listing type"]
+                    ):
+                        page.wait_for_timeout(800)
+                        try:
+                            page.get_by_role("option", name=sale_or_rent_label).first.click()
+                            success = True
+                        except Exception:
+                            print(f"  ! Set '{sale_or_rent_label}' manually in the browser.")
+                    else:
+                        print(f"  ! Set '{sale_or_rent_label}' manually in the browser.")
+                tracer.field("sale_or_rent", success)
+                page.wait_for_timeout(1500)  # let form re-render after type change
 
-            fill_marketplace_form(page, data, description)
+            fill_marketplace_form(page, data, description, tracer)
 
             # ---- 7) Hand control back to you to review and Publish ---------
             print("\n" + "=" * 60)
@@ -514,9 +655,12 @@ def main() -> None:
             context.close()
     except PWTimeout as e:
         print(f"  ! Timed out: {e}")
+        tracer.dump(page, "timeout")
     except Exception as e:
         print(f"  ! Error: {e}")
+        tracer.dump(page, "error")
     finally:
+        tracer.summary()
         log_result(url, result)
         cleanup()
         print(f"\nLogged result: {result}. Temp photos cleaned up. Done.")
