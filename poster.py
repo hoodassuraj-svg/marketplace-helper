@@ -167,6 +167,35 @@ def open_named_combobox(page, names) -> bool:
     return False
 
 
+def _ensure_sale_or_rent(page, listing_type, label) -> bool:
+    """Make sure the listing is set to For Sale / For Rent.
+
+    Facebook's create flow routes to a type-specific URL when you pick the Home
+    category -- a rental lands on .../create/rental, a sale does not. So if the
+    URL already reflects the type we want, it's already correct and we skip the
+    dropdown entirely (which otherwise burns ~45s of timeouts hunting for an
+    option list that isn't there). Only when the URL disagrees do we open the
+    listing-type combobox by name (never the Search box) and pick the option.
+    """
+    want_rent = (listing_type == "rent")
+    url_is_rental = "rental" in page.url.lower() or "/rent" in page.url.lower()
+    if want_rent == url_is_rental:
+        print(f"  Listing type already '{label}' (per page URL) -- skipping dropdown.")
+        return True
+
+    if select_dropdown(page, ["Home for Sale or Rent", "Sale or Rent", "Listing type"], label):
+        return True
+    if open_named_combobox(page, ["home for sale or rent", "sale or rent", "listing type"]):
+        page.wait_for_timeout(800)
+        try:
+            page.get_by_role("option", name=label).first.click()
+            return True
+        except Exception:
+            pass
+    print(f"  ! Set '{label}' manually in the browser.")
+    return False
+
+
 def fill_location(page, data) -> bool:
     """Type the city into the location field and pick the first suggestion.
 
@@ -618,25 +647,7 @@ def main() -> None:
             with tracer.step("Set Sale/Rent type"):
                 sale_or_rent_label = "For Rent" if data.listing_type == "rent" else "For Sale"
                 page.wait_for_timeout(1000)
-                success = select_dropdown(
-                    page,
-                    ["Home for Sale or Rent", "Sale or Rent", "Listing type"],
-                    sale_or_rent_label,
-                )
-                if not success:
-                    # Fallback: open the listing-type combobox BY NAME (never the
-                    # Search box) and pick the option.
-                    if open_named_combobox(
-                        page, ["home for sale or rent", "sale or rent", "listing type"]
-                    ):
-                        page.wait_for_timeout(800)
-                        try:
-                            page.get_by_role("option", name=sale_or_rent_label).first.click()
-                            success = True
-                        except Exception:
-                            print(f"  ! Set '{sale_or_rent_label}' manually in the browser.")
-                    else:
-                        print(f"  ! Set '{sale_or_rent_label}' manually in the browser.")
+                success = _ensure_sale_or_rent(page, data.listing_type, sale_or_rent_label)
                 tracer.field("sale_or_rent", success)
                 page.wait_for_timeout(1500)  # let form re-render after type change
 

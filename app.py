@@ -283,7 +283,7 @@ def _run_poster(url: str) -> str:
         import config, scraper
         from poster import (get_listing, fill_marketplace_form, save_draft,
                             log_result, cleanup, MARKETPLACE_CREATE_URL,
-                            select_dropdown, open_named_combobox)
+                            select_dropdown, open_named_combobox, _ensure_sale_or_rent)
         from tracer import Tracer
         from playwright.sync_api import sync_playwright
     except Exception as e:
@@ -345,18 +345,7 @@ def _run_poster(url: str) -> str:
             with tracer.step("Set Sale/Rent type"):
                 sor = "For Rent" if data.listing_type == "rent" else "For Sale"
                 page.wait_for_timeout(1000)
-                ok = select_dropdown(page, ["Home for Sale or Rent", "Sale or Rent"], sor)
-                if not ok:
-                    # Open the listing-type combobox BY NAME (never the Search box).
-                    if open_named_combobox(page, ["home for sale or rent", "sale or rent"]):
-                        page.wait_for_timeout(800)
-                        try:
-                            page.get_by_role("option", name=sor).first.click()
-                            ok = True
-                        except Exception:
-                            print(f"  ! Set '{sor}' manually in the browser.")
-                    else:
-                        print(f"  ! Set '{sor}' manually in the browser.")
+                ok = _ensure_sale_or_rent(page, data.listing_type, sor)
                 tracer.field("sale_or_rent", ok)
                 page.wait_for_timeout(1500)
 
