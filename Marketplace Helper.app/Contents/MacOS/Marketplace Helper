@@ -2,8 +2,23 @@
 # Launcher inside the .app bundle.
 DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$DIR"
-if [ -f ".venv/bin/python" ]; then
-    ".venv/bin/python" app.py
+
+# Absolute path to the venv python -- a bare relative path can fail to
+# resolve under Finder's minimal launch environment.
+if [ -x "$DIR/.venv/bin/python" ]; then
+    PY="$DIR/.venv/bin/python"
 else
-    python3 app.py
+    PY="$(command -v python3)"
 fi
+
+# Log every launch (silently -- no dialogs, no osascript, no extra
+# permission prompts) so a failed launch is diagnosable after the fact.
+LOG="$DIR/launch_error.log"
+{
+    echo "=== launch $(date) ==="
+    echo "DIR=$DIR"
+    echo "PY=$PY"
+} > "$LOG"
+
+"$PY" app.py >> "$LOG" 2>&1
+echo "=== exited with code $? ===" >> "$LOG"
